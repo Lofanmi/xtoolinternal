@@ -10,7 +10,7 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/Just-maple/xtoolinternal/event/label"
+	"github.com/Lofanmi/xtoolinternal/event/label"
 )
 
 // Value represents a key for untyped values.

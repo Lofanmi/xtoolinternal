@@ -7,9 +7,9 @@ package event
 import (
 	"context"
 
-	"github.com/Just-maple/xtoolinternal/event/core"
-	"github.com/Just-maple/xtoolinternal/event/keys"
-	"github.com/Just-maple/xtoolinternal/event/label"
+	"github.com/Lofanmi/xtoolinternal/event/core"
+	"github.com/Lofanmi/xtoolinternal/event/keys"
+	"github.com/Lofanmi/xtoolinternal/event/label"
 )
 
 // Exporter is a function that handles events.

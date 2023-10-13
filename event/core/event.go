@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Just-maple/xtoolinternal/event/label"
+	"github.com/Lofanmi/xtoolinternal/event/label"
 )
 
 // Event holds the information about an event of note that ocurred.

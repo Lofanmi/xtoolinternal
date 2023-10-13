@@ -1,4 +1,4 @@
-module github.com/Just-maple/xtoolinternal
+module github.com/Lofanmi/xtoolinternal
 
 go 1.17
 

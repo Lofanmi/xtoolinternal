@@ -25,8 +25,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/Just-maple/xtoolinternal/gocommand"
-	"github.com/Just-maple/xtoolinternal/gopathwalk"
+	"github.com/Lofanmi/xtoolinternal/gocommand"
+	"github.com/Lofanmi/xtoolinternal/gopathwalk"
 	"golang.org/x/tools/go/ast/astutil"
 )
 

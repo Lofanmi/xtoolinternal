@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Just-maple/xtoolinternal/event"
+	"github.com/Lofanmi/xtoolinternal/event"
 )
 
 // An Runner will run go command invocations and serialize

@@ -7,8 +7,8 @@ package core
 import (
 	"context"
 
-	"github.com/Just-maple/xtoolinternal/event/keys"
-	"github.com/Just-maple/xtoolinternal/event/label"
+	"github.com/Lofanmi/xtoolinternal/event/keys"
+	"github.com/Lofanmi/xtoolinternal/event/label"
 )
 
 // Log1 takes a message and one label delivers a log event to the exporter.

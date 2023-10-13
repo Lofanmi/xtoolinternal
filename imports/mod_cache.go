@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/Just-maple/xtoolinternal/gopathwalk"
+	"github.com/Lofanmi/xtoolinternal/gopathwalk"
 )
 
 // To find packages to import, the resolver needs to know about all of the

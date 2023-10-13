@@ -10,7 +10,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/Just-maple/xtoolinternal/event/label"
+	"github.com/Lofanmi/xtoolinternal/event/label"
 )
 
 // Exporter is a function that handles events.
