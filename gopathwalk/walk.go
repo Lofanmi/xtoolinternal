@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/charlievieth/fastwalk"
+	"github.com/spf13/cast"
 )
 
 // Options controls the behavior of a Walk call.
@@ -86,7 +87,10 @@ func walkDir(root Root, add func(Root, string), skip func(root Root, dir string)
 		opts: opts,
 	}
 	w.init()
-	conf := &fastwalk.Config{Follow: true}
+	conf := &fastwalk.Config{
+		Follow:     true,
+		NumWorkers: cast.ToInt(os.Getenv("GOPATH_WALK_NUM_WORKERS")),
+	}
 	if err := fastwalk.Walk(conf, root.Path, func(path string, d fs.DirEntry, e error) error {
 		if e != nil {
 			return e
