@@ -1,5 +1,7 @@
 github.com/charlievieth/fastwalk v1.0.1 h1:jW01w8OCFdKS9JvAcnI+JHhWU/FuIEmNb24Ri9p7OVg=
 github.com/charlievieth/fastwalk v1.0.1/go.mod h1:dryXgMJyGHbMrAmmnF0/EJNBbZaihlwcNud5IuGyogU=
+github.com/charlievieth/fastwalk v1.0.9-0.20240831210941-940d64f94b80 h1:ksD5dGxmyN4m/EBMJnW5WUec/dO9ybzUS6OsAzbxxXo=
+github.com/charlievieth/fastwalk v1.0.9-0.20240831210941-940d64f94b80/go.mod h1:yGy1zbxog41ZVMcKA/i8ojXLFsuayX5VvwhQVoj9PBI=
 github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=
 github.com/frankban/quicktest v1.14.4 h1:g2rn0vABPOOXmZUj+vbmUp0lPoXEMuhTpIluN0XL9UY=
 github.com/frankban/quicktest v1.14.4/go.mod h1:4ptaffx2x8+WTWXmUCuVU6aPUX1/Mz7zb5vbUoiM6w0=
