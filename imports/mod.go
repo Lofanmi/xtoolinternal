@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -14,10 +13,29 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Lofanmi/cmap"
 	"github.com/Lofanmi/xtoolinternal/gocommand"
 	"github.com/Lofanmi/xtoolinternal/gopathwalk"
 	"golang.org/x/mod/module"
 )
+
+// modInfoResult stores cached results from modInfo function
+type modInfoResult struct {
+	ModDir  string `json:"modDir"`
+	ModName string `json:"modName"`
+}
+
+// CanonicalizeResult wraps the result of canonicalize function for JSON serialization
+type CanonicalizeResult struct {
+	Pkg   *pkg   `json:"pkg,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
+// PackageDirToNameResult stores cached results from packageDirToName function
+type PackageDirToNameResult struct {
+	PackageName string `json:"packageName"`
+	Error       string `json:"error,omitempty"`
+}
 
 // ModuleResolver implements resolver for modules using the go command as little
 // as feasible.
@@ -37,15 +55,124 @@ type ModuleResolver struct {
 	// moduleCacheCache stores information about the module cache.
 	moduleCacheCache *dirInfoCache
 	otherCache       *dirInfoCache
+
+	// modInfoCache caches results from modInfo function using CMap
+	modInfoCache *cmap.Map[string, modInfoResult]
+
+	// canonicalizeCache caches results from canonicalize function using CMap
+	canonicalizeCache *cmap.Map[string, CanonicalizeResult]
+
+	// packageDirToNameCache caches results from packageDirToName function using CMap
+	packageDirToNameCache *cmap.Map[string, PackageDirToNameResult]
+}
+
+// generateCanonicalizeCacheKey generates a cache key for canonicalize function
+func generateCanonicalizeCacheKey(info directoryPackageInfo) string {
+	data := info.dir + "|" + strconv.Itoa(int(info.rootType)) + "|" + info.nonCanonicalImportPath
+	if info.moduleName != "" {
+		data += "|" + info.moduleName
+	}
+	return data
+}
+
+// loadCanonicalizeCache loads the canonicalize cache from disk using CMap
+func (r *ModuleResolver) loadCanonicalizeCache() error {
+	cacheFile := filepath.Join(os.TempDir(), "canonicalize_cache."+defaultCMapSerializer.Name())
+
+	return r.canonicalizeCache.LoadFromFile(cacheFile)
+}
+
+// saveCanonicalizeCache saves the canonicalize cache to disk using CMap
+func (r *ModuleResolver) saveCanonicalizeCache() error {
+	if !r.canonicalizeCache.IsDirty() {
+		return nil
+	}
+
+	cacheFile := filepath.Join(os.TempDir(), "canonicalize_cache."+defaultCMapSerializer.Name())
+
+	return r.canonicalizeCache.SaveToFile(cacheFile)
+}
+
+// loadPackageDirToNameCache loads the packageDirToName cache from disk using CMap
+func (r *ModuleResolver) loadPackageDirToNameCache() {
+	cacheFile := filepath.Join(os.TempDir(), "packagedirtoname_cache."+defaultCMapSerializer.Name())
+
+	_ = r.packageDirToNameCache.LoadFromFile(cacheFile)
+}
+
+// savePackageDirToNameCache saves the packageDirToName cache to disk using CMap
+func (r *ModuleResolver) savePackageDirToNameCache() {
+	if !r.packageDirToNameCache.IsDirty() {
+		return
+	}
+
+	cacheFile := filepath.Join(os.TempDir(), "packagedirtoname_cache."+defaultCMapSerializer.Name())
+
+	_ = r.packageDirToNameCache.SaveToFile(cacheFile)
 }
 
 func newModuleResolver(e *ProcessEnv) *ModuleResolver {
 	r := &ModuleResolver{
 		env:      e,
 		scanSema: make(chan struct{}, 1),
+		modInfoCache: cmap.New[string, modInfoResult](
+			cmap.WithSerializer(defaultCMapSerializer),
+		),
+		canonicalizeCache: cmap.New[string, CanonicalizeResult](
+			cmap.WithSerializer(defaultCMapSerializer),
+		),
+		packageDirToNameCache: cmap.New[string, PackageDirToNameResult](
+			cmap.WithSerializer(defaultCMapSerializer),
+		),
 	}
+
+	r.loadModInfoCache()
+	r.loadCanonicalizeCache()
+	r.loadPackageDirToNameCache()
+
 	r.scanSema <- struct{}{}
 	return r
+}
+
+// loadModInfoCache loads the modInfo cache from disk using CMap
+func (r *ModuleResolver) loadModInfoCache() {
+	cacheFile := filepath.Join(os.TempDir(), "modinfo_cache."+defaultCMapSerializer.Name())
+
+	_ = r.modInfoCache.LoadFromFile(cacheFile)
+}
+
+// saveModInfoCache saves the modInfo cache to disk using CMap
+func (r *ModuleResolver) saveModInfoCache() {
+	// 先检查是否有修改，没有修改就不保存也不打印
+	if !r.modInfoCache.IsDirty() {
+		return
+	}
+
+	cacheFile := filepath.Join(os.TempDir(), "modinfo_cache."+defaultCMapSerializer.Name())
+
+	_ = r.modInfoCache.SaveToFile(cacheFile)
+}
+
+// packageDirToNameWithCache is a cached version of packageDirToName function
+func (r *ModuleResolver) packageDirToNameWithCache(dir string) (string, error) {
+	if cached, ok := r.packageDirToNameCache.Get(dir); ok {
+		if cached.Error != "" {
+			return "", fmt.Errorf(cached.Error)
+		}
+		return cached.PackageName, nil
+	}
+
+	// 调用原来的函数
+	packageName, err := packageDirToName(dir)
+
+	// 缓存结果
+	if err != nil {
+		r.packageDirToNameCache.Put(dir, PackageDirToNameResult{Error: err.Error()})
+	} else {
+		r.packageDirToNameCache.Put(dir, PackageDirToNameResult{PackageName: packageName})
+	}
+
+	return packageName, err
 }
 
 func (r *ModuleResolver) init() error {
@@ -105,20 +232,20 @@ func (r *ModuleResolver) init() error {
 	})
 
 	r.roots = []gopathwalk.Root{
-		{filepath.Join(goenv["GOROOT"], "/src"), gopathwalk.RootGOROOT},
+		{Path: filepath.Join(goenv["GOROOT"], "/src"), Type: gopathwalk.RootGOROOT},
 	}
 	if r.main != nil {
-		r.roots = append(r.roots, gopathwalk.Root{r.main.Dir, gopathwalk.RootCurrentModule})
+		r.roots = append(r.roots, gopathwalk.Root{Path: r.main.Dir, Type: gopathwalk.RootCurrentModule})
 	}
 	if vendorEnabled {
-		r.roots = append(r.roots, gopathwalk.Root{r.dummyVendorMod.Dir, gopathwalk.RootOther})
+		r.roots = append(r.roots, gopathwalk.Root{Path: r.dummyVendorMod.Dir, Type: gopathwalk.RootOther})
 	} else {
 		addDep := func(mod *gocommand.ModuleJSON) {
 			if mod.Replace == nil {
 				// This is redundant with the cache, but we'll skip it cheaply enough.
-				r.roots = append(r.roots, gopathwalk.Root{mod.Dir, gopathwalk.RootModuleCache})
+				r.roots = append(r.roots, gopathwalk.Root{Path: mod.Dir, Type: gopathwalk.RootModuleCache})
 			} else {
-				r.roots = append(r.roots, gopathwalk.Root{mod.Dir, gopathwalk.RootOther})
+				r.roots = append(r.roots, gopathwalk.Root{Path: mod.Dir, Type: gopathwalk.RootOther})
 			}
 		}
 		// Walk dependent modules before scanning the full mod cache, direct deps first.
@@ -132,21 +259,15 @@ func (r *ModuleResolver) init() error {
 				addDep(mod)
 			}
 		}
-		r.roots = append(r.roots, gopathwalk.Root{r.moduleCacheDir, gopathwalk.RootModuleCache})
+		r.roots = append(r.roots, gopathwalk.Root{Path: r.moduleCacheDir, Type: gopathwalk.RootModuleCache})
 	}
 
 	r.scannedRoots = map[gopathwalk.Root]bool{}
 	if r.moduleCacheCache == nil {
-		r.moduleCacheCache = &dirInfoCache{
-			dirs:      map[string]*directoryPackageInfo{},
-			listeners: map[*int]cacheListener{},
-		}
+		r.moduleCacheCache = newDirInfoCache()
 	}
 	if r.otherCache == nil {
-		r.otherCache = &dirInfoCache{
-			dirs:      map[string]*directoryPackageInfo{},
-			listeners: map[*int]cacheListener{},
-		}
+		r.otherCache = newDirInfoCache()
 	}
 	r.initialized = true
 	return nil
@@ -183,10 +304,7 @@ func (r *ModuleResolver) initAllMods() error {
 func (r *ModuleResolver) ClearForNewScan() {
 	<-r.scanSema
 	r.scannedRoots = map[gopathwalk.Root]bool{}
-	r.otherCache = &dirInfoCache{
-		dirs:      map[string]*directoryPackageInfo{},
-		listeners: map[*int]cacheListener{},
-	}
+	r.otherCache = newDirInfoCache()
 	r.scanSema <- struct{}{}
 }
 
@@ -197,7 +315,21 @@ func (r *ModuleResolver) ClearForNewMod() {
 		moduleCacheCache: r.moduleCacheCache,
 		otherCache:       r.otherCache,
 		scanSema:         r.scanSema,
+		modInfoCache: cmap.New[string, modInfoResult](
+			cmap.WithSerializer(defaultCMapSerializer),
+		),
+		canonicalizeCache: cmap.New[string, CanonicalizeResult](
+			cmap.WithSerializer(defaultCMapSerializer),
+		),
+		packageDirToNameCache: cmap.New[string, PackageDirToNameResult](
+			cmap.WithSerializer(defaultCMapSerializer),
+		),
 	}
+	// 重新加载缓存
+	r.loadModInfoCache()
+	r.loadCanonicalizeCache()
+	r.loadPackageDirToNameCache()
+
 	r.init()
 	r.scanSema <- struct{}{}
 }
@@ -238,7 +370,7 @@ func (r *ModuleResolver) findPackage(importPath string) (*gocommand.ModuleJSON, 
 		}
 
 		// Not cached. Read the filesystem.
-		pkgFiles, err := ioutil.ReadDir(pkgDir)
+		pkgFiles, err := os.ReadDir(pkgDir)
 		if err != nil {
 			continue
 		}
@@ -275,6 +407,12 @@ func (r *ModuleResolver) cacheKeys() []string {
 
 // cachePackageName caches the package name for a dir already in the cache.
 func (r *ModuleResolver) cachePackageName(info directoryPackageInfo) (string, error) {
+	// 先尝试从我们的缓存获取
+	if name, err := r.packageDirToNameWithCache(info.dir); err == nil {
+		return name, nil
+	}
+
+	// 如果缓存中没有，则使用原来的方法
 	if info.rootType == gopathwalk.RootModuleCache {
 		return r.moduleCacheCache.CachePackageName(info)
 	}
@@ -338,8 +476,16 @@ func (r *ModuleResolver) dirIsNestedModule(dir string, mod *gocommand.ModuleJSON
 }
 
 func (r *ModuleResolver) modInfo(dir string) (modDir string, modName string) {
+	if cached, ok := r.modInfoCache.Get(dir); ok {
+		return cached.ModDir, cached.ModName
+	}
+	originalDir := dir
+	defer func() {
+		r.modInfoCache.Put(originalDir, modInfoResult{ModDir: modDir, ModName: modName})
+	}()
+
 	readModName := func(modFile string) string {
-		modBytes, err := ioutil.ReadFile(modFile)
+		modBytes, err := os.ReadFile(modFile)
 		if err != nil {
 			return ""
 		}
@@ -388,7 +534,7 @@ func (r *ModuleResolver) loadPackageNames(importPaths []string, srcDir string) (
 		if packageDir == "" {
 			continue
 		}
-		name, err := packageDirToName(packageDir)
+		name, err := r.packageDirToNameWithCache(packageDir)
 		if err != nil {
 			continue
 		}
@@ -415,7 +561,7 @@ func (r *ModuleResolver) scan(ctx context.Context, callback *scanCallback) error
 		if !callback.dirFound(pkg) {
 			return
 		}
-		pkg.packageName, err = r.cachePackageName(info)
+		pkg.PackageName, err = r.cachePackageName(info)
 		if err != nil {
 			return
 		}
@@ -487,6 +633,9 @@ func (r *ModuleResolver) scan(ctx context.Context, callback *scanCallback) error
 	case <-ctx.Done():
 	case <-scanDone:
 	}
+	r.saveModInfoCache()
+	r.saveCanonicalizeCache()
+	r.savePackageDirToNameCache()
 	return nil
 }
 
@@ -527,14 +676,29 @@ func modRelevance(mod *gocommand.ModuleJSON) float64 {
 
 // canonicalize gets the result of canonicalizing the packages using the results
 // of initializing the resolver from 'go list -m'.
-func (r *ModuleResolver) canonicalize(info directoryPackageInfo) (*pkg, error) {
+func (r *ModuleResolver) canonicalize(info directoryPackageInfo) (resPkg *pkg, err error) {
+	cacheKey := generateCanonicalizeCacheKey(info)
+	if cached, ok := r.canonicalizeCache.Get(cacheKey); ok {
+		if cached.Error != "" {
+			return nil, fmt.Errorf(cached.Error)
+		}
+		return cached.Pkg, nil
+	}
+	defer func() {
+		if resPkg != nil {
+			r.canonicalizeCache.Put(cacheKey, CanonicalizeResult{Pkg: resPkg})
+		} else if err != nil {
+			r.canonicalizeCache.Put(cacheKey, CanonicalizeResult{Error: err.Error()})
+		}
+	}()
+
 	// Packages in GOROOT are already canonical, regardless of the std/cmd modules.
 	if info.rootType == gopathwalk.RootGOROOT {
 		return &pkg{
-			importPathShort: info.nonCanonicalImportPath,
-			dir:             info.dir,
-			packageName:     path.Base(info.nonCanonicalImportPath),
-			relevance:       MaxRelevance,
+			ImportPathShort: info.nonCanonicalImportPath,
+			Dir:             info.dir,
+			PackageName:     path.Base(info.nonCanonicalImportPath),
+			Relevance:       MaxRelevance,
 		}, nil
 	}
 
@@ -557,14 +721,14 @@ func (r *ModuleResolver) canonicalize(info directoryPackageInfo) (*pkg, error) {
 	}
 
 	res := &pkg{
-		importPathShort: importPath,
-		dir:             info.dir,
-		relevance:       modRelevance(mod),
+		ImportPathShort: importPath,
+		Dir:             info.dir,
+		Relevance:       modRelevance(mod),
 	}
 	// We may have discovered a package that has a different version
 	// in scope already. Canonicalize to that one if possible.
 	if _, canonicalDir := r.findPackage(importPath); canonicalDir != "" {
-		res.dir = canonicalDir
+		res.Dir = canonicalDir
 	}
 	return res, nil
 }
@@ -573,10 +737,10 @@ func (r *ModuleResolver) loadExports(ctx context.Context, pkg *pkg, includeTest 
 	if err := r.init(); err != nil {
 		return "", nil, err
 	}
-	if info, ok := r.cacheLoad(pkg.dir); ok && !includeTest {
+	if info, ok := r.cacheLoad(pkg.Dir); ok && !includeTest {
 		return r.cacheExports(ctx, r.env, info)
 	}
-	return loadExportsFromFiles(ctx, r.env, pkg.dir, includeTest)
+	return loadExportsFromFiles(ctx, r.env, pkg.Dir, includeTest)
 }
 
 func (r *ModuleResolver) scanDirForPackage(root gopathwalk.Root, dir string) directoryPackageInfo {

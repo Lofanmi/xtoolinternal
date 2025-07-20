@@ -7,7 +7,7 @@ package imports
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/build"
@@ -25,8 +25,10 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/Lofanmi/cmap"
 	"github.com/Lofanmi/xtoolinternal/gocommand"
 	"github.com/Lofanmi/xtoolinternal/gopathwalk"
+	"github.com/bytedance/sonic"
 	"golang.org/x/tools/go/ast/astutil"
 )
 
@@ -106,7 +108,7 @@ func parseOtherFiles(fset *token.FileSet, srcDir, filename string) []*ast.File {
 	considerTests := strings.HasSuffix(filename, "_test.go")
 
 	fileBase := filepath.Base(filename)
-	packageFileInfos, err := ioutil.ReadDir(srcDir)
+	packageFileInfos, err := os.ReadDir(srcDir)
 	if err != nil {
 		return nil
 	}
@@ -518,6 +520,17 @@ func (p *pass) addCandidate(imp *ImportInfo, pkg *packageInfo) {
 // easily be extended by adding a file with an init function.
 var fixImports = fixImportsDefault
 
+var globalPackageDirToNameCache *cmap.Map[string, PackageDirToNameResult]
+
+// Gob 是最快的!
+var defaultCMapSerializer = cmap.GobSerializer()
+
+func init() {
+	globalPackageDirToNameCache = cmap.New[string, PackageDirToNameResult](
+		cmap.WithSerializer(defaultCMapSerializer),
+	)
+}
+
 func fixImportsDefault(fset *token.FileSet, f *ast.File, filename string, env *ProcessEnv) error {
 	fixes, err := getFixes(fset, f, filename, env)
 	if err != nil {
@@ -601,7 +614,7 @@ const MaxRelevance = 7.0
 // from disk.
 func getCandidatePkgs(ctx context.Context, wrappedCallback *scanCallback, filename, filePkg string, env *ProcessEnv) error {
 	notSelf := func(p *pkg) bool {
-		return p.packageName != filePkg || p.dir != filepath.Dir(filename)
+		return p.PackageName != filePkg || p.Dir != filepath.Dir(filename)
 	}
 	goenv, err := env.goEnv()
 	if err != nil {
@@ -614,10 +627,10 @@ func getCandidatePkgs(ctx context.Context, wrappedCallback *scanCallback, filena
 	// Start off with the standard library.
 	for importPath, exports := range stdlib {
 		p := &pkg{
-			dir:             filepath.Join(goenv["GOROOT"], "src", importPath),
-			importPathShort: importPath,
-			packageName:     path.Base(importPath),
-			relevance:       MaxRelevance,
+			Dir:             filepath.Join(goenv["GOROOT"], "src", importPath),
+			ImportPathShort: importPath,
+			PackageName:     path.Base(importPath),
+			Relevance:       MaxRelevance,
 		}
 		dupCheck[importPath] = struct{}{}
 		if notSelf(p) && wrappedCallback.dirFound(p) && wrappedCallback.packageNameLoaded(p) {
@@ -635,17 +648,17 @@ func getCandidatePkgs(ctx context.Context, wrappedCallback *scanCallback, filena
 		packageNameLoaded: func(pkg *pkg) bool {
 			mu.Lock()
 			defer mu.Unlock()
-			if _, ok := dupCheck[pkg.importPathShort]; ok {
+			if _, ok := dupCheck[pkg.ImportPathShort]; ok {
 				return false
 			}
-			dupCheck[pkg.importPathShort] = struct{}{}
+			dupCheck[pkg.ImportPathShort] = struct{}{}
 			return notSelf(pkg) && wrappedCallback.packageNameLoaded(pkg)
 		},
 		exportsLoaded: func(pkg *pkg, exports []string) {
 			// If we're an x_test, load the package under test's test variant.
-			if strings.HasSuffix(filePkg, "_test") && pkg.dir == filepath.Dir(filename) {
+			if strings.HasSuffix(filePkg, "_test") && pkg.Dir == filepath.Dir(filename) {
 				var err error
-				_, exports, err = loadExportsFromFiles(ctx, env, pkg.dir, true)
+				_, exports, err = loadExportsFromFiles(ctx, env, pkg.Dir, true)
 				if err != nil {
 					return
 				}
@@ -689,8 +702,8 @@ func PrimeCache(ctx context.Context, env *ProcessEnv) error {
 }
 
 func candidateImportName(pkg *pkg) string {
-	if ImportPathToAssumedName(pkg.importPathShort) != pkg.packageName {
-		return pkg.packageName
+	if ImportPathToAssumedName(pkg.ImportPathShort) != pkg.PackageName {
+		return pkg.PackageName
 	}
 	return ""
 }
@@ -703,26 +716,26 @@ func GetAllCandidates(ctx context.Context, wrapped func(ImportFix), searchPrefix
 			return true
 		},
 		dirFound: func(pkg *pkg) bool {
-			if !canUse(filename, pkg.dir) {
+			if !canUse(filename, pkg.Dir) {
 				return false
 			}
 			// Try the assumed package name first, then a simpler path match
 			// in case of packages named vN, which are not uncommon.
-			return strings.HasPrefix(ImportPathToAssumedName(pkg.importPathShort), searchPrefix) ||
-				strings.HasPrefix(path.Base(pkg.importPathShort), searchPrefix)
+			return strings.HasPrefix(ImportPathToAssumedName(pkg.ImportPathShort), searchPrefix) ||
+				strings.HasPrefix(path.Base(pkg.ImportPathShort), searchPrefix)
 		},
 		packageNameLoaded: func(pkg *pkg) bool {
-			if !strings.HasPrefix(pkg.packageName, searchPrefix) {
+			if !strings.HasPrefix(pkg.PackageName, searchPrefix) {
 				return false
 			}
 			wrapped(ImportFix{
 				StmtInfo: ImportInfo{
-					ImportPath: pkg.importPathShort,
+					ImportPath: pkg.ImportPathShort,
 					Name:       candidateImportName(pkg),
 				},
-				IdentName: pkg.packageName,
+				IdentName: pkg.PackageName,
 				FixType:   AddImport,
-				Relevance: pkg.relevance,
+				Relevance: pkg.Relevance,
 			})
 			return false
 		},
@@ -738,20 +751,20 @@ func GetImportPaths(ctx context.Context, wrapped func(ImportFix), searchPrefix, 
 			return true
 		},
 		dirFound: func(pkg *pkg) bool {
-			if !canUse(filename, pkg.dir) {
+			if !canUse(filename, pkg.Dir) {
 				return false
 			}
-			return strings.HasPrefix(pkg.importPathShort, searchPrefix)
+			return strings.HasPrefix(pkg.ImportPathShort, searchPrefix)
 		},
 		packageNameLoaded: func(pkg *pkg) bool {
 			wrapped(ImportFix{
 				StmtInfo: ImportInfo{
-					ImportPath: pkg.importPathShort,
+					ImportPath: pkg.ImportPathShort,
 					Name:       candidateImportName(pkg),
 				},
-				IdentName: pkg.packageName,
+				IdentName: pkg.PackageName,
 				FixType:   AddImport,
-				Relevance: pkg.relevance,
+				Relevance: pkg.Relevance,
 			})
 			return false
 		},
@@ -775,19 +788,19 @@ func GetPackageExports(ctx context.Context, wrapped func(PackageExport), searchP
 			return pkgIsCandidate(filename, references{searchPkg: nil}, pkg)
 		},
 		packageNameLoaded: func(pkg *pkg) bool {
-			return pkg.packageName == searchPkg
+			return pkg.PackageName == searchPkg
 		},
 		exportsLoaded: func(pkg *pkg, exports []string) {
 			sort.Strings(exports)
 			wrapped(PackageExport{
 				Fix: &ImportFix{
 					StmtInfo: ImportInfo{
-						ImportPath: pkg.importPathShort,
+						ImportPath: pkg.ImportPathShort,
 						Name:       candidateImportName(pkg),
 					},
-					IdentName: pkg.packageName,
+					IdentName: pkg.PackageName,
 					FixType:   AddImport,
-					Relevance: pkg.relevance,
+					Relevance: pkg.Relevance,
 				},
 				Exports: exports,
 			})
@@ -881,7 +894,7 @@ func (e *ProcessEnv) init() error {
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &goEnv); err != nil {
+	if err := sonic.Unmarshal(stdout.Bytes(), &goEnv); err != nil {
 		return err
 	}
 	for k, v := range goEnv {
@@ -1034,20 +1047,20 @@ func addExternalCandidates(pass *pass, refs references, filename string) error {
 			return pkgIsCandidate(filename, refs, pkg)
 		},
 		packageNameLoaded: func(pkg *pkg) bool {
-			if _, want := refs[pkg.packageName]; !want {
+			if _, want := refs[pkg.PackageName]; !want {
 				return false
 			}
-			if pkg.dir == pass.srcDir && pass.f.Name.Name == pkg.packageName {
+			if pkg.Dir == pass.srcDir && pass.f.Name.Name == pkg.PackageName {
 				// The candidate is in the same directory and has the
 				// same package name. Don't try to import ourselves.
 				return false
 			}
-			if !canUse(filename, pkg.dir) {
+			if !canUse(filename, pkg.Dir) {
 				return false
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			found[pkg.packageName] = append(found[pkg.packageName], pkgDistance{pkg, distance(pass.srcDir, pkg.dir)})
+			found[pkg.PackageName] = append(found[pkg.PackageName], pkgDistance{pkg, distance(pass.srcDir, pkg.Dir)})
 			return false // We'll do our own loading after we sort.
 		},
 	}
@@ -1096,7 +1109,7 @@ func addExternalCandidates(pass *pass, refs references, filename string) error {
 			}
 
 			imp := &ImportInfo{
-				ImportPath: found.importPathShort,
+				ImportPath: found.ImportPathShort,
 			}
 
 			pkg := &packageInfo{
@@ -1160,11 +1173,8 @@ type gopathResolver struct {
 
 func newGopathResolver(env *ProcessEnv) *gopathResolver {
 	r := &gopathResolver{
-		env: env,
-		cache: &dirInfoCache{
-			dirs:      map[string]*directoryPackageInfo{},
-			listeners: map[*int]cacheListener{},
-		},
+		env:      env,
+		cache:    newDirInfoCache(),
 		scanSema: make(chan struct{}, 1),
 	}
 	r.scanSema <- struct{}{}
@@ -1173,10 +1183,7 @@ func newGopathResolver(env *ProcessEnv) *gopathResolver {
 
 func (r *gopathResolver) ClearForNewScan() {
 	<-r.scanSema
-	r.cache = &dirInfoCache{
-		dirs:      map[string]*directoryPackageInfo{},
-		listeners: map[*int]cacheListener{},
-	}
+	r.cache = newDirInfoCache()
 	r.walked = false
 	r.scanSema <- struct{}{}
 }
@@ -1216,13 +1223,30 @@ func importPathToName(bctx *build.Context, importPath, srcDir string) string {
 // packageDirToName then only parses one file in the package,
 // trusting that the files in the directory are consistent.
 func packageDirToName(dir string) (packageName string, err error) {
+	if cached, ok := globalPackageDirToNameCache.Get(dir); ok {
+		if cached.Error != "" {
+			return "", fmt.Errorf(cached.Error)
+		}
+		return cached.PackageName, nil
+	}
+
 	d, err := os.Open(dir)
 	if err != nil {
+		result := PackageDirToNameResult{
+			PackageName: "",
+			Error:       err.Error(),
+		}
+		globalPackageDirToNameCache.Put(dir, result)
 		return "", err
 	}
 	names, err := d.Readdirnames(-1)
 	d.Close()
 	if err != nil {
+		result := PackageDirToNameResult{
+			PackageName: "",
+			Error:       err.Error(),
+		}
+		globalPackageDirToNameCache.Put(dir, result)
 		return "", err
 	}
 	sort.Strings(names) // to have predictable behavior
@@ -1255,19 +1279,35 @@ func packageDirToName(dir string) (packageName string, err error) {
 			// Since you can't import a package main anyway, there's no harm here.
 			continue
 		}
+		result := PackageDirToNameResult{
+			PackageName: pkgName,
+			Error:       "",
+		}
+		globalPackageDirToNameCache.Put(dir, result)
 		return pkgName, nil
 	}
 	if lastErr != nil {
+		result := PackageDirToNameResult{
+			PackageName: "",
+			Error:       lastErr.Error(),
+		}
+		globalPackageDirToNameCache.Put(dir, result)
 		return "", lastErr
 	}
-	return "", fmt.Errorf("no importable package found in %d Go files", nfile)
+	errMsg := fmt.Sprintf("no importable package found in %d Go files", nfile)
+	result := PackageDirToNameResult{
+		PackageName: "",
+		Error:       errMsg,
+	}
+	globalPackageDirToNameCache.Put(dir, result)
+	return "", errors.New(errMsg)
 }
 
 type pkg struct {
-	dir             string  // absolute file path to pkg directory ("/usr/lib/go/src/net/http")
-	importPathShort string  // vendorless import path ("net/http", "a/b")
-	packageName     string  // package name loaded from source if requested
-	relevance       float64 // a weakly-defined score of how relevant a package is. 0 is most relevant.
+	Dir             string  `json:"dir"`             // absolute file path to pkg directory ("/usr/lib/go/src/net/http")
+	ImportPathShort string  `json:"importPathShort"` // vendorless import path ("net/http", "a/b")
+	PackageName     string  `json:"packageName"`     // package name loaded from source if requested
+	Relevance       float64 `json:"relevance"`       // a weakly-defined score of how relevant a package is. 0 is most relevant.
 }
 
 type pkgDistance struct {
@@ -1292,7 +1332,7 @@ func (s byDistanceOrImportPathShortLength) Less(i, j int) bool {
 		return di < dj
 	}
 
-	vi, vj := s[i].pkg.importPathShort, s[j].pkg.importPathShort
+	vi, vj := s[i].pkg.ImportPathShort, s[j].pkg.ImportPathShort
 	if len(vi) != len(vj) {
 		return len(vi) < len(vj)
 	}
@@ -1335,19 +1375,19 @@ func (r *gopathResolver) scan(ctx context.Context, callback *scanCallback) error
 		}
 
 		p := &pkg{
-			importPathShort: info.nonCanonicalImportPath,
-			dir:             info.dir,
-			relevance:       MaxRelevance - 1,
+			ImportPathShort: info.nonCanonicalImportPath,
+			Dir:             info.dir,
+			Relevance:       MaxRelevance - 1,
 		}
 		if info.rootType == gopathwalk.RootGOROOT {
-			p.relevance = MaxRelevance
+			p.Relevance = MaxRelevance
 		}
 
 		if !callback.dirFound(p) {
 			return
 		}
 		var err error
-		p.packageName, err = r.cache.CachePackageName(info)
+		p.PackageName, err = r.cache.CachePackageName(info)
 		if err != nil {
 			return
 		}
@@ -1367,9 +1407,9 @@ func (r *gopathResolver) scan(ctx context.Context, callback *scanCallback) error
 		return err
 	}
 	var roots []gopathwalk.Root
-	roots = append(roots, gopathwalk.Root{filepath.Join(goenv["GOROOT"], "src"), gopathwalk.RootGOROOT})
+	roots = append(roots, gopathwalk.Root{Path: filepath.Join(goenv["GOROOT"], "src"), Type: gopathwalk.RootGOROOT})
 	for _, p := range filepath.SplitList(goenv["GOPATH"]) {
-		roots = append(roots, gopathwalk.Root{filepath.Join(p, "src"), gopathwalk.RootGOPATH})
+		roots = append(roots, gopathwalk.Root{Path: filepath.Join(p, "src"), Type: gopathwalk.RootGOPATH})
 	}
 	// The callback is not necessarily safe to use in the goroutine below. Process roots eagerly.
 	roots = filterRoots(roots, callback.rootFound)
@@ -1412,10 +1452,10 @@ func filterRoots(roots []gopathwalk.Root, include func(gopathwalk.Root) bool) []
 }
 
 func (r *gopathResolver) loadExports(ctx context.Context, pkg *pkg, includeTest bool) (string, []string, error) {
-	if info, ok := r.cache.Load(pkg.dir); ok && !includeTest {
+	if info, ok := r.cache.Load(pkg.Dir); ok && !includeTest {
 		return r.cache.CacheExports(ctx, r.env, info)
 	}
-	return loadExportsFromFiles(ctx, r.env, pkg.dir, includeTest)
+	return loadExportsFromFiles(ctx, r.env, pkg.Dir, includeTest)
 }
 
 // VendorlessPath returns the devendorized version of the import path ipath.
@@ -1507,7 +1547,7 @@ func findImport(ctx context.Context, pass *pass, candidates []pkgDistance, pkgNa
 	sort.Sort(byDistanceOrImportPathShortLength(candidates))
 	if pass.env.Logf != nil {
 		for i, c := range candidates {
-			pass.env.Logf("%s candidate %d/%d: %v in %v", pkgName, i+1, len(candidates), c.pkg.importPathShort, c.pkg.dir)
+			pass.env.Logf("%s candidate %d/%d: %v in %v", pkgName, i+1, len(candidates), c.pkg.ImportPathShort, c.pkg.Dir)
 		}
 	}
 	resolver, err := pass.env.GetResolver()
@@ -1548,14 +1588,14 @@ func findImport(ctx context.Context, pass *pass, candidates []pkgDistance, pkgNa
 				}()
 
 				if pass.env.Logf != nil {
-					pass.env.Logf("loading exports in dir %s (seeking package %s)", c.pkg.dir, pkgName)
+					pass.env.Logf("loading exports in dir %s (seeking package %s)", c.pkg.Dir, pkgName)
 				}
 				// If we're an x_test, load the package under test's test variant.
-				includeTest := strings.HasSuffix(pass.f.Name.Name, "_test") && c.pkg.dir == pass.srcDir
+				includeTest := strings.HasSuffix(pass.f.Name.Name, "_test") && c.pkg.Dir == pass.srcDir
 				_, exports, err := resolver.loadExports(ctx, c.pkg, includeTest)
 				if err != nil {
 					if pass.env.Logf != nil {
-						pass.env.Logf("loading exports in dir %s (seeking package %s): %v", c.pkg.dir, pkgName, err)
+						pass.env.Logf("loading exports in dir %s (seeking package %s): %v", c.pkg.Dir, pkgName, err)
 					}
 					resc <- nil
 					return
@@ -1603,7 +1643,7 @@ func findImport(ctx context.Context, pass *pass, candidates []pkgDistance, pkgNa
 // searching for "client.New")
 func pkgIsCandidate(filename string, refs references, pkg *pkg) bool {
 	// Check "internal" and "vendor" visibility:
-	if !canUse(filename, pkg.dir) {
+	if !canUse(filename, pkg.Dir) {
 		return false
 	}
 
@@ -1620,7 +1660,7 @@ func pkgIsCandidate(filename string, refs references, pkg *pkg) bool {
 	// anyway. There's no reason goimports needs
 	// to be slow just to accommodate that.
 	for pkgIdent := range refs {
-		lastTwo := lastTwoComponents(pkg.importPathShort)
+		lastTwo := lastTwoComponents(pkg.ImportPathShort)
 		if strings.Contains(lastTwo, pkgIdent) {
 			return true
 		}

@@ -174,11 +174,13 @@ func (w *walker) getIgnoredDirs(path string) []string {
 
 // shouldSkipDir reports whether the file should be skipped or not.
 func (w *walker) shouldSkipDir(fi os.FileInfo, dir string) bool {
-	for _, ignoredDir := range w.ignoredDirs {
-		if os.SameFile(fi, ignoredDir) {
-			return true
-		}
-	}
+	_ = fi
+	// os.SameFile 非常慢，不要了。
+	// for _, ignoredDir := range w.ignoredDirs {
+	// 	if os.SameFile(fi, ignoredDir) {
+	// 		return true
+	// 	}
+	// }
 	if w.skip != nil {
 		// Check with the user specified callback.
 		return w.skip(w.root, dir)
@@ -210,8 +212,12 @@ func (w *walker) walk(path string, typ os.FileMode) error {
 			(!w.opts.ModulesEnabled && base == "node_modules") {
 			return filepath.SkipDir
 		}
-		fi, err := os.Lstat(path)
-		if err == nil && w.shouldSkipDir(fi, path) {
+		// 提速
+		// fi, err := os.Lstat(path)
+		// if err == nil && w.shouldSkipDir(fi, path) {
+		// 	return filepath.SkipDir
+		// }
+		if w.shouldSkipDir(nil, path) {
 			return filepath.SkipDir
 		}
 		return nil

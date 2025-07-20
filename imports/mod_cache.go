@@ -3,8 +3,9 @@ package imports
 import (
 	"context"
 	"fmt"
-	"sync"
+	"unsafe"
 
+	"github.com/Lofanmi/cmap"
 	"github.com/Lofanmi/xtoolinternal/gopathwalk"
 )
 
@@ -86,18 +87,26 @@ func (info *directoryPackageInfo) reachedStatus(target directoryPackageStatus) (
 // as they discover new things about the directory.
 //
 // The information in the cache is not expected to change for the cache's
-// lifetime, so there is no protection against competing writes. Users should
-// take care not to hold the cache across changes to the underlying files.
-//
-// TODO(suzmue): consider other concurrency strategies and data structures (RWLocks, sync.Map, etc)
+// lifetime, using https://github.com/Lofanmi/cmap for better concurrent performance.
 type dirInfoCache struct {
-	mu sync.Mutex
 	// dirs stores information about packages in directories, keyed by absolute path.
-	dirs      map[string]*directoryPackageInfo
-	listeners map[*int]cacheListener
+	dirs      *cmap.Map[string, *directoryPackageInfo]
+	listeners *cmap.Map[int, cacheListener]
 }
 
 type cacheListener func(directoryPackageInfo)
+
+// newDirInfoCache creates a new dirInfoCache with initialized cmap instances
+func newDirInfoCache() *dirInfoCache {
+	return &dirInfoCache{
+		dirs: cmap.New[string, *directoryPackageInfo](
+			cmap.WithSerializer(defaultCMapSerializer),
+		),
+		listeners: cmap.New[int, cacheListener](
+			cmap.WithSerializer(defaultCMapSerializer),
+		),
+	}
+}
 
 // ScanAndListen calls listener on all the items in the cache, and on anything
 // newly added. The returned stop function waits for all in-flight callbacks to
@@ -113,15 +122,13 @@ func (d *dirInfoCache) ScanAndListen(ctx context.Context, listener cacheListener
 		sema <- struct{}{}
 	}
 
-	cookie := new(int) // A unique ID we can use for the listener.
+	cookie := int(uintptr(unsafe.Pointer(new(int)))) // A unique ID we can use for the listener.
 
-	// We can't hold mu while calling the listener.
-	d.mu.Lock()
-	var keys []string
-	for key := range d.dirs {
-		keys = append(keys, key)
-	}
-	d.listeners[cookie] = func(info directoryPackageInfo) {
+	// Get all current keys using cmap's Keys method
+	keys := d.dirs.Keys()
+
+	// Add the listener using cmap's Set method
+	d.listeners.Put(cookie, func(info directoryPackageInfo) {
 		select {
 		case <-ctx.Done():
 			return
@@ -129,14 +136,11 @@ func (d *dirInfoCache) ScanAndListen(ctx context.Context, listener cacheListener
 		}
 		listener(info)
 		sema <- struct{}{}
-	}
-	d.mu.Unlock()
+	})
 
 	stop := func() {
 		cancel()
-		d.mu.Lock()
-		delete(d.listeners, cookie)
-		d.mu.Unlock()
+		d.listeners.Remove(cookie)
 		for i := 0; i < maxInFlight; i++ {
 			<-sema
 		}
@@ -159,27 +163,20 @@ func (d *dirInfoCache) ScanAndListen(ctx context.Context, listener cacheListener
 
 // Store stores the package info for dir.
 func (d *dirInfoCache) Store(dir string, info directoryPackageInfo) {
-	d.mu.Lock()
-	_, old := d.dirs[dir]
-	d.dirs[dir] = &info
-	var listeners []cacheListener
-	for _, l := range d.listeners {
-		listeners = append(listeners, l)
-	}
-	d.mu.Unlock()
+	_, old := d.dirs.Get(dir)
+	d.dirs.Put(dir, &info)
 
 	if !old {
-		for _, l := range listeners {
-			l(info)
+		// Notify all listeners
+		for _, listener := range d.listeners.Values() {
+			listener(info)
 		}
 	}
 }
 
 // Load returns a copy of the directoryPackageInfo for absolute directory dir.
 func (d *dirInfoCache) Load(dir string) (directoryPackageInfo, bool) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	info, ok := d.dirs[dir]
+	info, ok := d.dirs.Get(dir)
 	if !ok {
 		return directoryPackageInfo{}, false
 	}
@@ -188,12 +185,7 @@ func (d *dirInfoCache) Load(dir string) (directoryPackageInfo, bool) {
 
 // Keys returns the keys currently present in d.
 func (d *dirInfoCache) Keys() (keys []string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	for key := range d.dirs {
-		keys = append(keys, key)
-	}
-	return keys
+	return d.dirs.Keys()
 }
 
 func (d *dirInfoCache) CachePackageName(info directoryPackageInfo) (string, error) {
